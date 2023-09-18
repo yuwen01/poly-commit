@@ -18,7 +18,7 @@ mod data_structures;
 pub use data_structures::*;
 
 mod combinations;
-use combinations::*;
+// use combinations::*;
 
 use crate::challenge::ChallengeGenerator;
 use ark_crypto_primitives::sponge::CryptographicSponge;
@@ -37,9 +37,124 @@ pub struct MarlinPST13<E: Pairing, P: DenseMVPolynomial<E::ScalarField>, S: Cryp
     _sponge: PhantomData<S>,
 }
 
-impl<E: Pairing, P: DenseMVPolynomial<E::ScalarField>, S: CryptographicSponge>
+impl<E: Pairing, P: DenseMVPolynomial<E::ScalarField> + Sync, S: CryptographicSponge>
     MarlinPST13<E, P, S>
+where
+    P::Point: Index<usize, Output = E::ScalarField>,
 {
+    
+    /// Don't use this function in real life! I'm just putting this here
+    /// to test a feature more easily. Don't let your Betas get leaked!
+    ///
+    pub fn special_setup_with_beta<R: RngCore>(
+        max_degree: usize,
+        num_vars: Option<usize>,
+        rng: &mut R,
+        betas: &[E::ScalarField],
+    ) -> Result<UniversalParams<E, P>, Error> {
+        let num_vars = num_vars.ok_or(Error::InvalidNumberOfVariables)?;
+        if num_vars < 1 {
+            return Err(Error::InvalidNumberOfVariables);
+        }
+        if max_degree < 1 {
+            return Err(Error::DegreeIsZero);
+        }
+        let setup_time = start_timer!(|| format!(
+            "MarlinPST13::Setup with {} variables and max degree {}",
+            num_vars, max_degree
+        ));
+        
+        // Generators
+        let g = E::G1::rand(rng);
+        let gamma_g = E::G1::rand(rng);
+        let h = E::G2::rand(rng);
+
+        // Generate all possible monomials with `1 <= degree <= max_degree`
+        let (powers_of_beta, mut powers_of_beta_terms): (Vec<_>, Vec<_>) = (1..=max_degree)
+            .flat_map(|degree| {
+                // Sample all combinations of `degree` variables from `variable_set`
+                let terms: Vec<Vec<usize>> = (0..num_vars).map(|var| vec![var; degree]).collect();
+                // For each multiset in `terms` evaluate the corresponding monomial at the
+                // trapdoor and generate a `P::Term` object to index it
+                ark_std::cfg_into_iter!(terms)
+                    .map(|term| {
+                        let value: E::ScalarField = term.iter().map(|e| betas[*e]).product();
+                        let term = (0..num_vars)
+                            .map(|var| (var, term.iter().filter(|e| **e == var).count()))
+                            .collect();
+                        (value, P::Term::new(term))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unzip();
+
+        let scalar_bits = E::ScalarField::MODULUS_BIT_SIZE as usize;
+        let g_time = start_timer!(|| "Generating powers of G");
+        let window_size = FixedBase::get_mul_window_size(max_degree + 1);
+        let g_table = FixedBase::get_window_table(scalar_bits, window_size, g);
+        let mut powers_of_g =
+            FixedBase::msm::<E::G1>(scalar_bits, window_size, &g_table, &powers_of_beta);
+        powers_of_g.push(g);
+        powers_of_beta_terms.push(P::Term::new(vec![]));
+        end_timer!(g_time);
+
+        let gamma_g_time = start_timer!(|| "Generating powers of gamma * G");
+        let window_size = FixedBase::get_mul_window_size(max_degree + 2);
+        let gamma_g_table = FixedBase::get_window_table(scalar_bits, window_size, gamma_g);
+        // Each element `i` of `powers_of_gamma_g` is a vector of length `max_degree+1`
+        // containing `betas[i]^j \gamma G` for `j` from 1 to `max_degree+1` to support
+        // up to `max_degree` queries
+        let mut powers_of_gamma_g = vec![Vec::new(); num_vars];
+        ark_std::cfg_iter_mut!(powers_of_gamma_g)
+            .enumerate()
+            .for_each(|(i, v)| {
+                let mut powers_of_beta = Vec::with_capacity(max_degree);
+                let mut cur = E::ScalarField::one();
+                for _ in 0..=max_degree {
+                    cur *= &betas[i];
+                    powers_of_beta.push(cur);
+                }
+                *v = FixedBase::msm::<E::G1>(
+                    scalar_bits,
+                    window_size,
+                    &gamma_g_table,
+                    &powers_of_beta,
+                );
+            });
+        end_timer!(gamma_g_time);
+
+        let powers_of_g = E::G1::normalize_batch(&powers_of_g);
+        let gamma_g = gamma_g.into_affine();
+        let powers_of_gamma_g = powers_of_gamma_g
+            .into_iter()
+            .map(|v| E::G1::normalize_batch(&v))
+            .collect();
+        let beta_h: Vec<_> = betas.iter().map(|b| h.mul(b).into_affine()).collect();
+        let h = h.into_affine();
+        let prepared_h = h.into();
+        let prepared_beta_h = beta_h.iter().map(|bh| (*bh).into()).collect();
+
+        // Convert `powers_of_g` to a BTreeMap indexed by `powers_of_beta_terms`
+        let powers_of_g = powers_of_beta_terms
+            .into_iter()
+            .zip(powers_of_g.into_iter())
+            .collect();
+
+        let pp = UniversalParams {
+            num_vars,
+            max_degree,
+            powers_of_g,
+            gamma_g,
+            powers_of_gamma_g,
+            h,
+            beta_h,
+            prepared_h,
+            prepared_beta_h,
+        };
+        end_timer!(setup_time);
+        Ok(pp)
+    }
+
     /// Given some point `z`, compute the quotients `w_i(X)` s.t
     ///
     /// `p(X) - p(z) = (X_1-z_1)*w_1(X) + (X_2-z_2)*w_2(X) + ... + (X_l-z_l)*w_l(X)`
@@ -172,112 +287,12 @@ where
         if max_degree < 1 {
             return Err(Error::DegreeIsZero);
         }
-        let setup_time = start_timer!(|| format!(
-            "MarlinPST13::Setup with {} variables and max degree {}",
-            num_vars, max_degree
-        ));
         // Trapdoor evaluation points
         let mut betas = Vec::with_capacity(num_vars);
         for _ in 0..num_vars {
             betas.push(E::ScalarField::rand(rng));
         }
-        // Generators
-        let g = E::G1::rand(rng);
-        let gamma_g = E::G1::rand(rng);
-        let h = E::G2::rand(rng);
-
-        // A list of all variable numbers of multiplicity `max_degree`
-        let variable_set: Vec<_> = (0..num_vars)
-            .flat_map(|var| vec![var; max_degree])
-            .collect();
-        // Generate all possible monomials with `1 <= degree <= max_degree`
-        let (powers_of_beta, mut powers_of_beta_terms): (Vec<_>, Vec<_>) = (1..=max_degree)
-            .flat_map(|degree| {
-                // Sample all combinations of `degree` variables from `variable_set`
-                let terms: Vec<Vec<usize>> = if variable_set.len() == degree {
-                    vec![variable_set.clone()]
-                } else {
-                    Combinations::new(variable_set.clone(), degree).collect()
-                };
-                // For each multiset in `terms` evaluate the corresponding monomial at the
-                // trapdoor and generate a `P::Term` object to index it
-                ark_std::cfg_into_iter!(terms)
-                    .map(|term| {
-                        let value: E::ScalarField = term.iter().map(|e| betas[*e]).product();
-                        let term = (0..num_vars)
-                            .map(|var| (var, term.iter().filter(|e| **e == var).count()))
-                            .collect();
-                        (value, P::Term::new(term))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unzip();
-
-        let scalar_bits = E::ScalarField::MODULUS_BIT_SIZE as usize;
-        let g_time = start_timer!(|| "Generating powers of G");
-        let window_size = FixedBase::get_mul_window_size(max_degree + 1);
-        let g_table = FixedBase::get_window_table(scalar_bits, window_size, g);
-        let mut powers_of_g =
-            FixedBase::msm::<E::G1>(scalar_bits, window_size, &g_table, &powers_of_beta);
-        powers_of_g.push(g);
-        powers_of_beta_terms.push(P::Term::new(vec![]));
-        end_timer!(g_time);
-
-        let gamma_g_time = start_timer!(|| "Generating powers of gamma * G");
-        let window_size = FixedBase::get_mul_window_size(max_degree + 2);
-        let gamma_g_table = FixedBase::get_window_table(scalar_bits, window_size, gamma_g);
-        // Each element `i` of `powers_of_gamma_g` is a vector of length `max_degree+1`
-        // containing `betas[i]^j \gamma G` for `j` from 1 to `max_degree+1` to support
-        // up to `max_degree` queries
-        let mut powers_of_gamma_g = vec![Vec::new(); num_vars];
-        ark_std::cfg_iter_mut!(powers_of_gamma_g)
-            .enumerate()
-            .for_each(|(i, v)| {
-                let mut powers_of_beta = Vec::with_capacity(max_degree);
-                let mut cur = E::ScalarField::one();
-                for _ in 0..=max_degree {
-                    cur *= &betas[i];
-                    powers_of_beta.push(cur);
-                }
-                *v = FixedBase::msm::<E::G1>(
-                    scalar_bits,
-                    window_size,
-                    &gamma_g_table,
-                    &powers_of_beta,
-                );
-            });
-        end_timer!(gamma_g_time);
-
-        let powers_of_g = E::G1::normalize_batch(&powers_of_g);
-        let gamma_g = gamma_g.into_affine();
-        let powers_of_gamma_g = powers_of_gamma_g
-            .into_iter()
-            .map(|v| E::G1::normalize_batch(&v))
-            .collect();
-        let beta_h: Vec<_> = betas.iter().map(|b| h.mul(b).into_affine()).collect();
-        let h = h.into_affine();
-        let prepared_h = h.into();
-        let prepared_beta_h = beta_h.iter().map(|bh| (*bh).into()).collect();
-
-        // Convert `powers_of_g` to a BTreeMap indexed by `powers_of_beta_terms`
-        let powers_of_g = powers_of_beta_terms
-            .into_iter()
-            .zip(powers_of_g.into_iter())
-            .collect();
-
-        let pp = UniversalParams {
-            num_vars,
-            max_degree,
-            powers_of_g,
-            gamma_g,
-            powers_of_gamma_g,
-            h,
-            beta_h,
-            prepared_h,
-            prepared_beta_h,
-        };
-        end_timer!(setup_time);
-        Ok(pp)
+        Self::special_setup_with_beta(max_degree, Some(num_vars), rng, &betas)
     }
 
     /// Specializes the public parameters for polynomials up to the given `supported_degree`
